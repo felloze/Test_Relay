@@ -1,0 +1,12 @@
+# 工作区数据与临时文件，不入库
+.workbuddy/
+.build_check/
+.sim/
+
+# 编译产物
+*.o
+*.d
+build/
+
+# IDE
+.vscode/
