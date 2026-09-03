@@ -16,7 +16,8 @@
 | 措施 | 说明 |
 |---|---|
 | 非阻塞状态机 | 触点识别、蜂鸣器时序、按键扫描全部非阻塞，主循环不再有 `delay(300)` 长阻塞窗口 |
-| 触点三级去抖 | 消隐窗口（继电器动作后 20ms 不采样）→ 稳定性滤波（连续 3 次采样一致才采纳）→ 判据闸门（距动作 ≥50ms 且四路全稳才允许报警判定） |
+| 继电器动作保护窗 | 测试键按下/释放（或识别流程）使继电器动作后，`RELAY_GUARD_MS`（50ms，覆盖 ~10ms 机械延时 + 弹跳）内 ForceTest 静音待判，避免「新继电器状态 + 旧触点值」判据自相矛盾而误鸣 |
+| 灵敏报警判定 | 保护窗外 ForceTest 直接读触点引脚原始电平、逐主循环判定，无滤波拖累——压力测试中真实故障的报警延迟即主循环周期 |
 | 统一继电器入口 | 所有继电器动作走 `setRelay()`，`RELAY_STATE` 与实际驱动电平严格同步 |
 | 引脚抗干扰 | 功能键 `INPUT_PULLDOWN`、触点采样 `INPUT_PULLDOWN`、TM1650 ACK 引脚上拉输入 + 短超时 |
 | IWDG 独立看门狗 | 2s 超时（LSI 32kHz / 64 分频），跑飞自动复位；启动时通过串口报告上次复位原因 |
@@ -24,9 +25,9 @@
 关键可调参数集中在 `Test_Relay.ino` 头部：
 
 ```cpp
-#define USE_IWDG 1              // 0 = 编译期完全剥离看门狗
-#define RELAY_SETTLE_MS    20   // 消隐窗口，需 > 继电器机械延时（约 10ms）
-#define CONTACT_STABLE_CNT 3    // 稳定采样次数，10ms × 3
+#define USE_IWDG 1         // 0 = 编译期完全剥离看门狗
+#define IWDG_TIMEOUT_MS 2000
+#define RELAY_GUARD_MS 50  // 继电器动作保护窗，需 > 机械延时 + 弹跳
 ```
 
 ## 硬件连接
@@ -52,14 +53,6 @@
 
 - **HAL 的 IWDG 不可用**：`cores/AirMCU/air/airyyxx_hal_conf.h` 把 `HAL_IWDG_MODULE_ENABLED` 放在 `#if 0` 的 "Unused HAL modules" 块内，`HAL_IWDG_Init / HAL_IWDG_Refresh` 链接报 undefined reference。本项目改用 **LL 驱动**（`air001xx_ll_iwdg.h`，纯头文件 static inline）。
 - 同在该 `#if 0` 块内的还有 CRC / DAC / EXTI / CAN / COMP / WWDG / USART 等，使用这些外设的 HAL 版本需自行开启模块开关。
-
-## 版本
-
-| 版本 | 主要变更 |
-|---|---|
-| 1.3 | 修复功能键概率性卡死：识别流程改非阻塞状态机，新增 IWDG |
-| 1.4 | 触点采样三级去抖，`setRelay()` 统一入口 |
-| 1.6 | 修复判据闸门缺时间下限导致的短促误响 |
 
 ## 作者
 

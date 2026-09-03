@@ -45,33 +45,27 @@ bool& NO2_STATE = contact_state[IDX_NO2];
 bool& NC1_STATE = contact_state[IDX_NC1];
 bool& NC2_STATE = contact_state[IDX_NC2];
 
-/******************** 触点去抖参数 ********************/
-// 继电器吸合/释放有约 10ms 机械延时，触点闭合瞬间还会机械弹跳，
-// 这段时间内采到的电平不代表真实状态。若拿去当判据，ForceTest 会在
-// 继电器每次动作时"嘀"一声误报。分三级处理：
-//   1) 消隐：RELAY 驱动电平变化后的 RELAY_SETTLE_MS 内不采样，沿用旧值
-//   2) 稳定：新值需连续 CONTACT_STABLE_CNT 次采样一致（10ms 节拍）才采纳
-//   3) 闸门：四路触点全部稳定后，才允许 ForceTest 的判据生效
-// 第 3 级是关键：判据必须是「新继电器状态 + 新触点值」，两者必须同时更新。
-// 只要触点值比继电器状态晚一步被采纳，中间那十几毫秒判据就自相矛盾，
-// 表现正是"按下测试键蜂鸣器短促响一声"。
-#define RELAY_SETTLE_MS    20    // 消隐，需 > 继电器 ~10ms 机械延时
-#define CONTACT_STABLE_CNT 3     // 稳定，10ms × 3 = 30ms（按实际弹跳可加大）
-
-// 判据生效的最早时刻。仅有"四路都稳定"还不够：若继电器机械延时比消隐窗口还长，
-// 触点会先在"旧值"上被判稳，闸门提前打开，等触点真正动作时又出现错配。
-// 必须同时满足「累计采样次数足够」这个时间下限。
-#define CONTACT_MIN_VALID_MS (RELAY_SETTLE_MS + CONTACT_STABLE_CNT * 10)  // 50ms
-
-#define CONTACT_MAX_WAIT_MS 200  // 硬上限：触点若一直抖，也强制让判据生效，
-                                 // 避免真实故障被无限期屏蔽
+/******************** 继电器动作保护窗（按键去抖） ********************/
+// 去抖只服务一个目的：测试键按下/释放（或识别流程）导致继电器动作后，
+// 触点有 ~10ms 机械延时 + 弹跳，这段时间采到的电平不代表真实状态。
+// 若拿去当判据，ForceTest 会拿到「新继电器状态 + 旧触点值」而误鸣一声。
+//
+// 保护窗 = 继电器动作后的 RELAY_GUARD_MS 内，ForceTest 静音待判。
+// 窗口一过，ForceTest 直接读引脚原始电平、逐循环判定，灵敏响应——
+// 压力测试中真实故障的报警延迟就是主循环周期，没有滤波拖累。
+//
+// （旧版的三级滤波：消隐 + 稳定计数 + all_stable 闸门已删除——
+//   那套会让所有时段的触点变化都延迟 40ms 才被采纳，与"灵敏响应"冲突。）
+#define RELAY_GUARD_MS 50  // 需 > 继电器 ~10ms 机械延时 + 弹跳，留足余量
 
 static const uint8_t contact_pin[4] = { NO1, NO2, NC1, NC2 };
-static bool    contact_last[4]      = { false, false, false, false };  // 上一拍采样值
-static uint8_t contact_cnt[4]       = { 0, 0, 0, 0 };                  // 连续一致计数
 
-uint32_t relay_change_time = 0;     // 最近一次继电器驱动电平变化的时刻
-static bool contacts_ready = true;  // 触点判据是否可信（四路全部稳定后由采样函数置位）
+uint32_t relay_change_time = 0;  // 最近一次继电器驱动电平变化的时刻
+
+// 继电器是否仍在动作保护窗内（此期间触点电平不可信）
+bool contactsSettling() {
+  return (millis() - relay_change_time) < RELAY_GUARD_MS;
+}
 
 /******************** 串口事件追踪（排障用，已注释） ********************/
 // 【已禁用】置 1 后，串口会在"继电器动作 / 触点稳定 / 报警判定翻转"三个时刻各打印一行，
@@ -85,8 +79,6 @@ static bool contacts_ready = true;  // 触点判据是否可信（四路全部�
 //   Serial.print(tag);
 //   Serial.print("  RLY=");
 //   Serial.print(RELAY_STATE);
-//   Serial.print(" ready=");
-//   Serial.print(contacts_ready ? 1 : 0);
 //   Serial.print("  NO1=");
 //   Serial.print(NO1_STATE);
 //   Serial.print(" NO2=");
@@ -102,24 +94,12 @@ static bool contacts_ready = true;  // 触点判据是否可信（四路全部�
 // #define traceEvent(tag) ((void)0)
 // #endif
 
-// 继电器统一入口：所有动作都走这里，以便记录动作时刻供消隐窗口使用
+// 继电器统一入口：所有动作都走这里，记录动作时刻供保护窗判断
 void setRelay(bool on) {
   digitalWrite(RELAY, on ? HIGH : LOW);
   RELAY_STATE = on ? 1 : 0;
   relay_change_time = millis();
-
-  // 驱动电平一变，判据立即失效，直到四路触点重新全部稳定为止
-  contacts_ready = false;
-  for (uint8_t i = 0; i < 4; i++) {
-    contact_cnt[i] = 0;
-    contact_last[i] = contact_state[i];
-  }
   // traceEvent(on ? "RLY->ON" : "RLY->OFF");  // 调试追踪已禁用
-}
-
-// 触点判据是否可信任：继电器刚动作、或触点仍在弹跳时不可信
-bool contactsSettling() {
-  return !contacts_ready;
 }
 
 bool BEEP_ON = false;    //蜂鸣器状态
@@ -190,59 +170,10 @@ void showContactType() {
   contact_show_time = millis();
 }
 
-// 立即采纳某路触点的当前电平（识别流程用：此时继电器已稳定 300ms，无需滤波）
+// 立即采纳某路触点的当前电平（识别流程专用：此时继电器已稳定 300ms）。
+// contact_state 只服务识别流程；ForceTest 不用它，直接读引脚。
 void contactCommit(uint8_t idx) {
-  bool v = digitalRead(contact_pin[idx]);
-  contact_state[idx] = v;   // 经引用同步到 NO1_STATE / NO2_STATE / ...
-  contact_last[idx] = v;
-  contact_cnt[idx] = 0;
-}
-
-// 更新所有触点状态（10ms 节拍调用，带消隐 + 稳定性滤波）
-void updateContactStates() {
-  uint32_t now = millis();
-  uint32_t dt = now - relay_change_time;
-
-  // 继电器动作后触点尚未到位，直接跳过，保持上一次的稳定值
-  if (dt < RELAY_SETTLE_MS) return;
-
-  bool all_stable = true;
-  for (uint8_t i = 0; i < 4; i++) {
-    bool raw = digitalRead(contact_pin[i]);
-
-    if (raw == contact_state[i]) {   // 与稳定值一致，无抖动
-      contact_last[i] = raw;
-      contact_cnt[i] = 0;
-    } else if (raw == contact_last[i]) {   // 新值保持中，累计
-      if (++contact_cnt[i] >= CONTACT_STABLE_CNT) {
-        contact_state[i] = raw;   // 攒够了，采纳新值
-        contact_cnt[i] = 0;
-      } else {
-        all_stable = false;       // 还没攒够，判据继续挂起
-      }
-    } else {                         // 出现新值（或在弹跳），重新开始累计
-      contact_last[i] = raw;
-      contact_cnt[i] = 1;
-      all_stable = false;
-    }
-  }
-
-  // 闸门打开必须同时满足两个条件：
-  //   a) 四路触点全部稳定（all_stable）
-  //   b) 距继电器动作已超过 CONTACT_MIN_VALID_MS（时间下限）
-  // 只有 (a) 有个致命漏洞：若继电器机械延时比消隐窗口 RELAY_SETTLE_MS 长
-  // （标称 ~10ms 但有离散性），消隐结束后的第一次采样采到的仍是旧值，
-  // 旧值 == 稳定值 -> all_stable 为真 -> 闸门带着「新继电器状态 + 旧触点值」
-  // 提前打开，ForceTest 判据自相矛盾，蜂鸣器短促误响一声，等触点真正动作
-  // 后又静音。时间下限保证闸门打开时触点必然已经历过真实动作。
-  // contact_state 与 contacts_ready 在同一次采样里一起更新，因此 ForceTest
-  // 永远不会拿到自相矛盾的组合。
-  if ((all_stable && dt >= CONTACT_MIN_VALID_MS) || dt >= CONTACT_MAX_WAIT_MS) {
-    if (!contacts_ready) {
-      contacts_ready = true;
-      // traceEvent(dt >= CONTACT_MAX_WAIT_MS ? "STABLE!" : "STABLE");  // 调试追踪已禁用
-    }
-  }
+  contact_state[idx] = digitalRead(contact_pin[idx]);
 }
 
 /******************** 触点类型识别（非阻塞状态机） ********************/
@@ -371,34 +302,43 @@ void SW_MODE() {
 }
 
 // 压力测试逻辑
+// 判定数据源：直接 digitalRead 四路触点引脚，逐循环刷新，无任何滤波。
+// 灵敏度 = 主循环周期（微秒级），真实故障立即报警。
+// 唯一的例外是保护窗：继电器刚动作后的 RELAY_GUARD_MS 内触点电平不可信，
+// 静音待判，避免「新继电器状态 + 旧触点值」的错配误鸣（按键去抖）。
 void ForceTest() {
   bool should_beep = false;
 
   if (contact_form == 0) return;
   if (beep_active) return;  // beep序列进行中，蜂鸣器由状态机驱动
 
-  // 继电器刚动作：驱动电平已经翻转，但触点要 ~10ms 才到位，采样值还是旧的。
-  // 此时判据必然自相矛盾，会误鸣一声。先静音并记住"待重判"，等触点稳定后再判。
+  // 继电器动作保护窗：先静音并复位报警状态，窗口过后立即重新判定
   if (contactsSettling()) {
     if (BUZZER_STATE) {
       BUZZER_STATE = false;
       digitalWrite(BUZZER, LOW);
     }
-    last_beep = false;  // 复位，稳定后重新判定并刷新一次蜂鸣器
+    last_beep = false;
     return;
   }
+
+  // 直接采样引脚原始电平（不经任何滤波，灵敏响应）
+  bool no1 = digitalRead(NO1);
+  bool no2 = digitalRead(NO2);
+  bool nc1 = digitalRead(NC1);
+  bool nc2 = digitalRead(NC2);
 
   switch (RELAY_STATE) {
     case 0:  // 释放状态
       switch (contact_form) {
-        case 1: should_beep = NO1_STATE; break;
+        case 1: should_beep = no1; break;
         case 2:
-        case 3: should_beep = !NC1_STATE || NO1_STATE; break;
-        case 4: should_beep = NO1_STATE || NO2_STATE; break;
-        case 5: should_beep = !NC1_STATE || !NC2_STATE; break;
-        case 6: should_beep = !NC1_STATE || !NC2_STATE || NO1_STATE || NO2_STATE; break;
-        case 7: should_beep = NO1_STATE || !NC2_STATE; break;
-        case 8: should_beep = NO2_STATE || !NC1_STATE; break;
+        case 3: should_beep = !nc1 || no1; break;
+        case 4: should_beep = no1 || no2; break;
+        case 5: should_beep = !nc1 || !nc2; break;
+        case 6: should_beep = !nc1 || !nc2 || no1 || no2; break;
+        case 7: should_beep = no1 || !nc2; break;
+        case 8: should_beep = no2 || !nc1; break;
         default: break;
       }
       break;
@@ -406,12 +346,12 @@ void ForceTest() {
     case 1:  // 吸合状态
       switch (contact_form) {
         case 1:
-        case 3: should_beep = !NO1_STATE || NC1_STATE; break;
-        case 4: should_beep = !NO1_STATE || !NO2_STATE; break;
-        case 5: should_beep = NC1_STATE || NC2_STATE; break;
-        case 6: should_beep = !NO1_STATE || !NO2_STATE || NC1_STATE || NC2_STATE; break;
-        case 7: should_beep = !NO1_STATE || NC2_STATE; break;
-        case 8: should_beep = !NO2_STATE || NC1_STATE; break;
+        case 3: should_beep = !no1 || nc1; break;
+        case 4: should_beep = !no1 || !no2; break;
+        case 5: should_beep = nc1 || nc2; break;
+        case 6: should_beep = !no1 || !no2 || nc1 || nc2; break;
+        case 7: should_beep = !no1 || nc2; break;
+        case 8: should_beep = !no2 || nc1; break;
         default: break;
       }
       break;
@@ -570,9 +510,6 @@ void loop() {
           }
         }
       }
-
-      // 更新触点状态
-      updateContactStates();
     }
   }
 
